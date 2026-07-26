@@ -7,10 +7,16 @@ chose deliberately, which is where sign-extension, shift-amount and byte-lane bu
 actually live.
 
 Constraints that keep a random stream meaningful rather than merely chaotic:
-  - no control flow in the body, so every program terminates in a known instruction count
+  - control flow is emitted, but only ever FORWARD, so the program is a DAG and
+    termination is still guaranteed without an instruction-count cap
   - x31 is reserved as the data base pointer and never written, so memory operations
     always land in a known-safe window well clear of the program image
   - shift amounts are drawn from the full 0..31 range including the boundaries
+
+The forward-only rule is what makes branch coverage possible at all here. An earlier
+version emitted no control flow, which guaranteed termination but left all eight branch
+and jump instructions at zero coverage: the regression looked large while never testing
+the PC-redirect path. Measuring coverage is what surfaced that.
 """
 import random
 import sys
@@ -21,12 +27,16 @@ SH_OPS = ["slli", "srli", "srai"]
 LOADS = ["lb", "lh", "lw", "lbu", "lhu"]
 STORES = ["sb", "sh", "sw"]
 
+BRANCHES = ["beq", "bne", "blt", "bge", "bltu", "bgeu"]
+
 DATA_BASE = 0x1000
 DATA_SPAN = 0x400
 
 # x0 is readable but never meaningfully written; x31 is the reserved data pointer.
+# x29 and x30 double as jump scratch, which is harmless since they hold random values.
 WRITABLE = list(range(0, 31))
 READABLE = list(range(0, 32))
+JUMP_SCRATCH = 30
 
 
 def interesting_imm(rng):
@@ -54,15 +64,49 @@ def gen(seed, n_body):
     for r in range(1, 31):
         out.append(f"    li x{r}, {hex(interesting_word(rng))}")
 
+    label_n = 0
+
+    def filler(count):
+        """Straight-line instructions used as branch-shadow bodies."""
+        out = []
+        for _ in range(count):
+            out.append(f"    addi x{rng.choice(WRITABLE)}, x{rng.choice(READABLE)}, "
+                       f"{interesting_imm(rng)}")
+        return out
+
     for _ in range(n_body):
         kind = rng.choices(
-            ["r", "i", "sh", "ld", "st", "lui", "auipc"],
-            weights=[30, 22, 14, 14, 12, 4, 4],
+            ["r", "i", "sh", "ld", "st", "lui", "auipc", "br", "jal", "jalr"],
+            weights=[26, 19, 12, 12, 10, 3, 3, 9, 3, 3],
         )[0]
 
         rd = rng.choice(WRITABLE)
         rs1 = rng.choice(READABLE)
         rs2 = rng.choice(READABLE)
+
+        # ---- control flow: forward only, so the program stays a DAG ----
+        if kind in ("br", "jal", "jalr"):
+            label_n += 1
+            lab = f"L{label_n}"
+            shadow = rng.randint(1, 3)
+
+            if kind == "br":
+                # Operands are random, so taken and not-taken both occur across seeds,
+                # and both paths converge on the label.
+                out.append(f"    {rng.choice(BRANCHES)} x{rs1}, x{rs2}, {lab}")
+            elif kind == "jal":
+                # Unconditional forward jump; the shadow instructions are unreachable,
+                # which is itself worth exercising.
+                out.append(f"    jal x{rng.choice(WRITABLE)}, {lab}")
+            else:
+                # Indirect jump: materialise the target address, then jump through it.
+                # Emitted adjacently so nothing can clobber the scratch register between.
+                out.append(f"    la x{JUMP_SCRATCH}, {lab}")
+                out.append(f"    jalr x0, x{JUMP_SCRATCH}, 0")
+
+            out.extend(filler(shadow))
+            out.append(f"{lab}:")
+            continue
 
         if kind == "r":
             out.append(f"    {rng.choice(R_OPS)} x{rd}, x{rs1}, x{rs2}")
