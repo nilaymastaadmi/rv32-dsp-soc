@@ -8,7 +8,10 @@
 // replacement for the trace-diff methodology that found the two real bugs.
 //
 // Built for Verilator specifically: Icarus Verilog's SystemVerilog support does not
-// include covergroups, so this file is Verilator-only. Run via `make sv-check`.
+// include covergroups, so this file is Verilator-only. Build with
+// `verilator --binary --coverage --assert --top-module tb_soc_sv <rtl files> tb/tb_soc_sv.sv`
+// (there is no Makefile target for this yet -- see the README's Coverage section for
+// the full invocation used to regenerate coverage.dat).
 
 `timescale 1ns / 1ps
 
