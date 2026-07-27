@@ -237,6 +237,85 @@ test-harness gap, not a design gap: rebuilding coverage instrumentation against
 `scripts/uart_testbench.py`) and merging that in is what produced the 96%+ per-file line
 coverage `uart.v` actually has once it's exercised the way it's meant to be.
 
+## Bare-metal C firmware
+
+`tests/uart_test.s` has a C counterpart in `firmware/`, cross-compiled with
+`riscv64-unknown-elf-gcc` and linked against a hand-written startup file and linker
+script. There is no libc, no OS, and no bootloader underneath it -- everything the C
+environment assumes has to be established by `crt0.S` before `main` runs:
+
+- a stack pointer, since C cannot call anything without one
+- zeroed `.bss`, which the C standard guarantees but the image does not contain
+- a jump to `main`, and `ecall` to halt the core when it returns
+
+`firmware/link.ld` places `.text` at address 0, because the core resets with `PC = 0` and
+there is nothing to relocate it. The region it links into stops at `0x5000`, which is
+where the host controller's shared area begins. That bound is not decoration: the stack
+grows down from the top of the region, and without the limit it would eventually grow
+into the vector block the host wrote, corrupting the test's own input. The linker
+physically cannot place a section there now.
+
+There is deliberately no `.data` copy loop. On a system booting from flash, `.data` has a
+load address in flash and a run address in RAM and startup copies between them. Here the
+image is loaded straight into the memory array at its final addresses, so the two are the
+same and a copy loop would move bytes onto themselves.
+
+### Assembly versus C
+
+Both builds run through the same host controller (`scripts/uart_testbench.py`) against
+the same 210 vectors, and the device results are diffed:
+
+```
+make firmware-compare
+```
+
+| build | cycles | cycles/byte |
+|---|---:|---:|
+| `tests/uart_test.s` (hand-written assembly) | 13,036 | 62.1 |
+| `firmware/uart_test.c` (gcc `-Os`) | 16,427 | 78.2 |
+
+Every one of the 210 received bytes is byte-for-byte identical between the two. Only the
+cycle count differs, and the C build costs **26% more cycles**. Two things account for
+that and neither is a compiler failing: function-call overhead across the driver
+boundary, which the flat assembly version does not pay, and a `tx_busy` wait in
+`uart_send()` that the assembly version simply does not perform. The second is not
+overhead so much as the C version being more careful -- the assembly relies on the
+loopback round-trip being slower than a transmit, which happens to hold here and would
+stop holding the moment anything queued two sends back to back.
+
+## Host transport layer
+
+The test controller reaches the device through a `Transport` interface
+(`scripts/transport.py`) rather than being wired directly to the simulator:
+
+| transport | far end |
+|---|---|
+| `SimulationTransport` | vector image + simulator subprocess (the original path) |
+| `SerialTransport` | a real device node via pyserial, 8N1, configurable baud |
+| `PtyLoopbackTransport` | a pseudo-terminal pair with an echo thread |
+
+The point of the third is that the serial path is not untested code waiting for hardware
+to appear. It is a genuine pyserial port with real termios configuration, exercised end
+to end:
+
+```
+make transport-selftest      # 210 bytes round-tripped, 0 mismatches, no hardware needed
+```
+
+Attaching a real board is then a change of port name, not a change of code.
+
+Being explicit about the limit: a pty has no wire. The loopback proves the framing of the
+software stack -- open, configure, write, read, timeout handling -- and proves nothing at
+all about baud accuracy, bit timing, or signal integrity. Those need a board and a scope.
+
+Two things about the pty were not obvious and are worth recording, because both present
+as "the device is dead" rather than as an error. Closing the slave fd after reading its
+name hangs up the pty immediately, so the master reads EOF and every subsequent read
+times out against silence. And a pty comes up with a terminal line discipline attached:
+canonical mode withholds bytes until a newline, `ECHO` reflects them, and `ONLCR`
+rewrites `\n` as `\r\n` -- all three corrupt a binary stream in which `0x0A` is an
+ordinary test vector, not a line terminator. Both ends are forced to raw mode.
+
 ## Two defects the harness caught
 
 Both were found by the trace comparison, not by reading waveforms, and both are recorded
