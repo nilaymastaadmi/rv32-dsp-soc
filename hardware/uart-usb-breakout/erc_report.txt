@@ -1,0 +1,15 @@
+ERC report (2026-07-28T02:35:42, Encoding UTF8)
+Report includes: Errors, Warnings, Exclusions
+
+***** Sheet /
+[lib_symbol_mismatch]: Symbol 'AMS1117-3.3' doesn't match copy in library 'Regulator_Linear'
+    ; warning
+    @(100.33 mm, 39.37 mm): Symbol U2 [AMS1117-3.3]
+
+ ** ERC messages: 1  Errors 0  Warnings 1
+
+ ** Ignored checks:
+    - Global label only appears once in the schematic
+    - Four connection points are joined together
+    - SPICE model issue
+    - Assigned footprint doesn't match footprint filters

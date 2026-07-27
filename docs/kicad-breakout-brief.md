@@ -113,3 +113,14 @@ caught by it.
 2. Why both a 10 µF and a 100 nF cap rather than one bigger one (different frequency ranges;
    the small one must sit close to the pin).
 3. Why 27 Ω on D+/D− (series termination for the differential pair).
+
+---
+
+## Result
+
+Live at `hardware/uart-usb-breakout/`: `uart-usb-breakout.kicad_sch`, the exported netlist
+(`uart-usb-breakout.net`), a rendered PDF, and the ERC report. Electrical rules check comes
+back at **0 errors, 1 expected warning** (a cosmetic library-copy notice on the AMS1117-3.3
+regulator, explained in the schematic's own title-block comment). Every net was checked by
+hand against this brief's bill of materials -- CC1/CC2 pulldowns, D+/D- termination, both
+LED activity indicators, and the 3.3V rail all land exactly where the BOM says they should.
