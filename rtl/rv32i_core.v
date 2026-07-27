@@ -203,19 +203,49 @@ module rv32i_core (
     end
 
     // ------------------------------------------------------------- sequential
+    //
+    // PC/halt control and the register file are split into separate always blocks so the
+    // register file's clock can be gated independently: PC must advance every non-halted
+    // cycle regardless of whether an instruction writes a register, but the register file
+    // only ever changes state on a cycle where commit_we is asserted (the write-enable
+    // already gates the *value*, in both variants below -- CLOCK_GATE_REGFILE additionally
+    // gates the *clock edge* itself, which is what actually saves dynamic power, since an
+    // ungated flip-flop still toggles its clock pin and re-latches its own feedback value
+    // on every cycle even when nothing changes).
     integer i;
+
+`ifdef CLOCK_GATE_REGFILE
+    // Integrated clock gating cell (ICG), standard latch-based form: the enable is only
+    // allowed to change while clk is low, so a combinational glitch on write_en cannot
+    // reach the gated clock net while clk is high and cause a spurious extra edge. This is
+    // the textbook-correct pattern; a bare "assign gated_clk = clk & write_en", with no
+    // latch, is the well-known unsafe version most write-ups warn against for exactly
+    // this reason (note: even writing that unsafe form inside a comment is unsafe here --
+    // a backtick immediately before an identifier is Verilog's macro-invocation syntax,
+    // and some preprocessors act on it even inside a // comment).
+    reg  enable_latch;
+    wire write_en = commit_we && !halt_r;
+    always @(*) if (!clk) enable_latch = write_en;
+    wire regfile_clk = clk & enable_latch;
+`else
+    wire regfile_clk = clk;
+`endif
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             pc     <= 32'd0;
             halt_r <= 1'b0;
-            for (i = 0; i < 32; i = i + 1) regs[i] <= 32'd0;
         end else if (!halt_r) begin
-            if (opcode == OP_SYSTEM) begin
-                halt_r <= 1'b1;          // ECALL/EBREAK ends the run, as in the ISS
-            end else begin
-                if (commit_we) regs[rd] <= wb_data;
-                pc <= next_pc;
-            end
+            if (opcode == OP_SYSTEM) halt_r <= 1'b1;   // ECALL/EBREAK ends the run, as in the ISS
+            else                     pc     <= next_pc;
+        end
+    end
+
+    always @(posedge regfile_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (i = 0; i < 32; i = i + 1) regs[i] <= 32'd0;
+        end else if (!halt_r && commit_we) begin
+            regs[rd] <= wb_data;
         end
     end
 
