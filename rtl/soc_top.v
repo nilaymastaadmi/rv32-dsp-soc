@@ -1,18 +1,15 @@
-// Top level: RV32I core, unified memory, and the correlator accelerator.
+// Top level: RV32I core, unified memory, the GNSS correlator accelerator, and a UART.
 //
-// Instruction fetch and CPU data access share one memory array with asynchronous read,
-// which mirrors the C++ ISS's flat address space exactly. That equivalence is deliberate:
-// the two models must disagree only when the RTL is wrong, never because their memory
-// maps differ.
-//
-// The accelerator gets its own read port into the same array. Giving it a private port
-// rather than arbitrating for the CPU's is what lets it consume one sample per cycle
-// while the CPU is doing something else, and in a physical design this is where a real
-// arbiter or a dedicated sample buffer would go.
+// Two peripherals now share the bus at distinct sub-regions, which is the standard shape
+// of a real SoC address map: one region per device, decoded off the high address bits.
+// Instruction fetch and CPU data access still share one memory array with asynchronous
+// read, mirroring the C++ ISS's flat address space exactly, so the two models can only
+// disagree when the RTL itself is wrong.
 
 module soc_top #(
     parameter MEM_WORDS   = 65536,
     parameter PERIPH_BASE = 32'h1000_0000,
+    parameter UART_BASE   = 32'h1000_1000,
     parameter ACC_W       = 32
 ) (
     input  wire        clk,
@@ -23,7 +20,13 @@ module soc_top #(
     output wire [4:0]  retire_rd,
     output wire [31:0] retire_val,
     output wire        retire_we,
-    output wire        halted
+    output wire        halted,
+
+    // UART pins, brought to the top level so a testbench can wire tx to rx for a
+    // loopback test, or eventually to a real pin if this were ever taken to synthesis
+    // on an actual FPGA.
+    output wire        uart_tx_pin,
+    input  wire        uart_rx_pin
 );
 
     wire [31:0] imem_addr, imem_data;
@@ -52,13 +55,17 @@ module soc_top #(
 
     reg [31:0] mem [0:MEM_WORDS-1];
 
-    wire is_periph = (dmem_addr >= PERIPH_BASE);
+    // Sub-decode within the peripheral region: UART_BASE sits above the correlator's
+    // register file (which occupies 0x00-0x17 off PERIPH_BASE), so the two ranges cannot
+    // overlap even as either grows.
+    wire is_periph      = (dmem_addr >= PERIPH_BASE) && (dmem_addr < UART_BASE);
+    wire is_uart         = (dmem_addr >= UART_BASE);
+    wire is_any_periph   = is_periph || is_uart;
 
-    // Accelerator sample fetch port.
     wire [31:0] sample_addr;
     wire signed [31:0] sample_data = mem[sample_addr[31:2]];
 
-    wire [31:0] periph_rdata;
+    wire [31:0] corr_rdata, uart_rdata;
 
     correlator_bus #(.ACC_W(ACC_W)) u_corr_bus (
         .clk         (clk),
@@ -67,21 +74,34 @@ module soc_top #(
         .we          (dmem_we),
         .addr        (dmem_addr),
         .wdata       (dmem_wdata),
-        .rdata       (periph_rdata),
+        .rdata       (corr_rdata),
         .sample_addr (sample_addr),
         .sample_data (sample_data)
+    );
+
+    uart_bus #(.CLK_DIV_W(16)) u_uart_bus (
+        .clk    (clk),
+        .rst_n  (rst_n),
+        .sel    (is_uart),
+        .we     (dmem_we),
+        .addr   (dmem_addr),
+        .wdata  (dmem_wdata),
+        .rdata  (uart_rdata),
+        .tx_pin (uart_tx_pin),
+        .rx_pin (uart_rx_pin)
     );
 
     assign imem_data = mem[imem_addr[31:2]];
 
     always @(*) begin
-        if (is_periph) dmem_rdata = periph_rdata;
-        else           dmem_rdata = mem[dmem_addr[31:2]];
+        if (is_uart)         dmem_rdata = uart_rdata;
+        else if (is_periph)  dmem_rdata = corr_rdata;
+        else                 dmem_rdata = mem[dmem_addr[31:2]];
     end
 
     // Per-lane commit, so SB and SH leave the untouched bytes of the word intact.
     always @(posedge clk) begin
-        if (dmem_we && !is_periph) begin
+        if (dmem_we && !is_any_periph) begin
             if (dmem_wstrb[0]) mem[dmem_addr[31:2]][7:0]   <= dmem_wdata[7:0];
             if (dmem_wstrb[1]) mem[dmem_addr[31:2]][15:8]  <= dmem_wdata[15:8];
             if (dmem_wstrb[2]) mem[dmem_addr[31:2]][23:16] <= dmem_wdata[23:16];
