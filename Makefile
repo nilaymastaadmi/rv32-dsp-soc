@@ -56,7 +56,8 @@ PREBUILT := firmware/prebuilt
 PYNN     := $(shell if [ -x $(HOME)/.venvs/nn/bin/python ]; then echo $(HOME)/.venvs/nn/bin/python; else echo python3; fi)
 
 .PHONY: all check iss hex sim sim-uart clean synth sta tools \
-        nn nn-train nn-sim nn-check nn-measure nn-synth nn-images nn-prebuilt regress
+        nn nn-train nn-sim nn-check nn-measure nn-synth nn-images nn-prebuilt nn-sweep \
+        regress test-all
 
 all: check
 
@@ -202,7 +203,30 @@ nn-measure: nn-images $(BUILD)/nn_sim
 nn-synth: | $(BUILD)
 	@bash scripts/synth_stat.sh
 
+# --- accuracy / latency / memory trade-off across hidden widths ---
+# Retrains and rebuilds, so it needs numpy and a cross-compiler. It temporarily overwrites the
+# generated headers and restores them in a finally block, verifying the restore with git.
+nn-sweep: $(BUILD)/nn_sim
+	$(PYNN) scripts/nn_sweep.py
+
 nn: nn-check nn-measure
+
+# --- everything, in the order a fresh clone should run it ---
+# The NN bit-exactness check is deliberately NOT folded into `make check`: `check` is the fast
+# trace-diff gate and should stay fast, while the software NN path is ~2.8M cycles and takes
+# minutes. This target is the "run the whole verification suite" entry point instead.
+#
+# The UART firmware is assembled via a recursive call with TEST overridden rather than named
+# as a prerequisite: the hex rule is `$(BUILD)/$(TEST).hex`, which only ever expands to the
+# one test named on the command line, so `$(BUILD)/uart_test.hex` matches no rule at all
+# unless TEST happens to be uart_test. A first version of this target had exactly that bug.
+test-all: check regress sim-uart nn-check
+	@$(MAKE) --no-print-directory hex TEST=uart_test
+	@python3 scripts/uart_testbench.py --hex $(BUILD)/uart_test.hex
+	@echo
+	@echo "==================================================================="
+	@echo "all verification flows completed -- see individual results above"
+	@echo "==================================================================="
 
 # Randomised regression, with its prerequisites made explicit so it cannot be run against a
 # stale or missing simulator. SEEDS/BODY override the defaults.

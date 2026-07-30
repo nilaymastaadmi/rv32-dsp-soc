@@ -51,20 +51,31 @@ inference.
 |---|---:|
 | float32 | 94.47% |
 | INT8, power-of-two requantisation | 94.44% |
-| **drop** | **0.03 pp** |
+| **delta** | **-0.03 pp** |
 
 Requantisation between the layers is a **power-of-two right shift** (`>> 10`), not the usual
 multiply-by-fixed-point-scale-then-shift. The usual form needs an int32 accumulator times an
 int32 multiplier in a 64-bit intermediate, and on a core with no hardware multiply a 64-bit
 multiply would cost more than the dot products this whole exercise exists to measure. The
 shift constrains every activation scale to a power of two, which was expected to cost
-accuracy. It cost 0.03 percentage points. That was a genuine surprise and it is reported in
-the direction it actually fell; the expectation going in was worse.
+accuracy, and it cost 0.03 percentage points.
+
+Do not read too much into the sign of that number. The size sweep below runs the same
+comparison at two other widths and INT8 comes out *ahead* of float32 at both, by 0.08 and 0.06
+pp. All three deltas are noise around zero, so the defensible claim is that this quantisation
+scheme costs the network nothing measurable, not that it costs 0.03 pp specifically.
 
 ReLU is applied *before* the shift so the shifted value is never negative. Right-shifting a
 negative integer is arithmetic in both C and numpy, but making a host model and a target
 agree on rounding by relying on that is a weaker guarantee than having no negative values to
 shift.
+
+Training is seeded and bit-reproducible: re-running `make nn-train` regenerates
+`firmware/weights.h` byte-identically to the committed version, which is checked incidentally
+every time the size sweep passes back through its 32-unit point and finds git reports the file
+clean. That matters because every cycle number here is tied to a specific set of weights --
+the software multiply's cost depends on the actual activation values -- so "the same model"
+has to mean the same bits, not merely the same architecture and accuracy.
 
 ### Cycles
 
@@ -153,6 +164,69 @@ data, correlator samples, MAC operands). A real SRAM does not hand out four read
 is the same deliberate flat-memory simplification recorded in Scope, and the block is no more
 optimistic about it than the correlator already was -- it takes one port and serialises its two
 operand streams rather than asking for a fifth.
+
+### Accuracy, latency and memory across model sizes
+
+Three hidden widths, each retrained from the same seed, requantised, rebuilt and re-measured.
+Bit-exactness is re-verified at every point, because a trade-off table built on an unverified
+forward pass would be measuring the wrong thing. `make nn-sweep`.
+
+| hidden | params (B) | MACs | float32 | INT8 | delta | sw cyc/inf | mac cyc/inf | speedup |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 3,400 | 3,296 | 92.88% | 92.96% | +0.08 pp | 68,138 | 2,236 | 30.48x |
+| 32 | 6,760 | 6,592 | 94.47% | 94.44% | -0.03 pp | 136,514 | 4,242 | 32.19x |
+| 64 | 13,480 | 13,184 | 94.65% | 94.71% | +0.06 pp | 269,557 | 8,215 | 32.81x |
+
+Four things fall out of this, and the first is a correction to how the headline quantisation
+result above should be read.
+
+**The INT8 accuracy delta is indistinguishable from zero, not slightly negative.** At two of
+the three sizes the quantised model scored *higher* than its float32 parent (+0.08 and +0.06
+pp), and at the third it scored lower (-0.03). All three are far smaller than the gap between
+adjacent model sizes. The honest reading of the whole table is that per-tensor symmetric INT8
+with power-of-two requantisation costs this network nothing measurable -- not that quantisation
+improves accuracy, which is what cherry-picking the +0.08 row would imply. The single -0.03 pp
+figure quoted earlier is one sample from that noise band.
+
+**Cycle cost is very close to linear in MAC count.** Doubling the hidden width doubles the MACs
+exactly (3,296 → 6,592 → 13,184) and the software cycles follow at 2.00x and 1.97x. Software
+cycles per MAC stay flat at 20.67, 20.71, 20.45 -- which is what the `9 + 8k` instruction model
+predicts, since neither term depends on the layer width.
+
+**The accelerator gets more efficient as vectors get longer**, from 0.678 cycles/MAC at width
+16 to 0.643 at 32 and 0.623 at 64, converging toward its 0.5 floor. That is the per-call
+overhead argument above, measured rather than asserted: the fixed cost of four register writes,
+a start, a poll and a read is amortised over more terms as the weight rows get longer. It is
+also why the speedup *rises* with model size (30.48x → 32.81x) instead of staying constant.
+
+**Accuracy saturates well before cost does.** Going from 16 to 32 units buys 1.59 pp for 2x the
+memory and cycles; going from 32 to 64 buys 0.18 pp for another 2x. On this task the 32-unit
+model is the sensible operating point, which is why it is the one committed.
+
+One discrepancy worth naming rather than leaving for someone to spot: the 32-unit row reads
+136,514 software cycles per inference where the headline table above says 139,813. Same
+firmware, same weights. The difference is the vector sample -- the sweep averages over 5
+inferences to keep three full retrain-and-remeasure cycles affordable, the headline result
+averages over 20 -- and the software multiply is data-dependent, so a different subset of
+images gives a different mean. The two numbers are 2.4% apart and neither is wrong; they are
+means over different samples, and that is exactly the kind of spread a data-dependent
+multiply produces.
+
+**A third defect, from the sweep's own tooling, worth recording because of how it presented.**
+The sweep rewrites the generated headers for each width and restores the committed ones
+afterwards. The restore used `shutil.copy2`, which preserves the source file's mtime -- so the
+restored `firmware/weights.h` came back with an mtime *older* than the firmware that had just
+been built for the 64-unit point. Make compared the two, saw a build product newer than its own
+source, and skipped the rebuild. `make nn-check` then ran 64-unit firmware against the 32-unit
+reference and failed all 200 logits.
+
+What makes it instructive is that every source file was correct and `git status` was clean
+throughout; the inconsistency lived entirely in `build/`. It was caught by `make test-all` on its
+first run, which is the argument for having a single umbrella target that rebuilds and re-checks
+everything rather than trusting that the last thing each individual flow left behind is still
+valid. Fixed by restoring with `copyfile` plus an explicit `utime`, and by deleting the sweep's
+firmware build products outright so a rebuild is forced by absence rather than by a timestamp
+comparison that can go wrong the same way twice.
 
 ## Synthesis (Yosys, generic cell library, `abc -g cmos` technology mapping)
 
@@ -287,13 +361,19 @@ names the exact PC and encoded instruction where the two models diverged.
 Coverage is a directed smoke test plus a constrained-random regression:
 
 ```
-make check TEST=smoke        # 62 instructions, hand-aimed at the classic decode traps
-bash scripts/regress.sh 400 300   # 400 random programs against the ISS
+make check TEST=smoke              # 62 instructions, hand-aimed at the classic decode traps
+make regress SEEDS=400 BODY=300    # random programs against the ISS
 ```
 
-The full 400-seed, ~150-instruction-per-program regression run: **153,632 instructions
-compared, 0 mismatches, all 38 RV32I base-integer mnemonics retired at least once.** The
-random generator reserves a data pointer and emits no control flow (a DAG of straight-line
+The quoted figure for the full 400-seed, ~150-instruction-per-program run is **153,632
+instructions compared, 0 mismatches, all 38 RV32I base-integer mnemonics retired at least
+once.** Read that alongside "Two verification flows that could never have run" below: the
+driver script referenced a simulator binary nothing ever built, so this figure cannot
+currently be reproduced from a clean checkout at that scale, and the largest run actually
+completed and verified in this repo's history is 40 seeds. The script works now; the
+400-seed number has simply not been re-earned since.
+
+The random generator reserves a data pointer and emits no control flow (a DAG of straight-line
 code, no backward jumps), so every program terminates in a known instruction count while
 still producing operand and immediate combinations nobody chose deliberately -- forward-only
 generation was itself a fix, after an earlier version of the generator that allowed
@@ -417,6 +497,10 @@ to phase 512 instead of 511, which immediately localised the fault to phase book
 rather than the datapath. The code generator's enable was registered, putting the slew one
 cycle out of step with its own counter. Fixed by driving the generator's control
 combinationally from the state, so N cycles in the slew state means exactly N chips.
+
+(A third, in the NN sweep's own tooling, is recorded in the size-sweep section above: a restore
+that preserved mtimes left correct sources next to a stale `build/`, and `make nn-check` failed
+all 200 logits while `git status` stayed clean.)
 
 ## Two verification flows that could never have run
 
@@ -559,8 +643,9 @@ layer is not a demanding benchmark, and no claim is being made that it is. The p
 exercise is the cost structure of integer inference on a core with no multiplier, which does
 not depend on the network being impressive.
 
-Two things named in the plan for this work are **not** done and are not being presented as if
-they were: the accuracy/latency/memory trade-off across multiple model sizes or quantisation
-schemes was the optional third phase and was not reached, and the per-call overhead that keeps
-the accelerator at 0.64 cycles/MAC instead of its 0.5 floor has been measured and explained but
-not fixed.
+Named limitations, so none of these has to be inferred: the per-call overhead that keeps the
+accelerator at 0.64 cycles/MAC instead of its 0.5 floor has been measured and explained but not
+fixed; the size sweep varies hidden width only, not the quantisation scheme, so
+per-channel weights or a multiply-based requantisation remain unmeasured; and the sweep's cycle
+figures average over 5 inferences rather than 20, which is a narrower sample than the headline
+result and differs from it by 2.4% for that reason.

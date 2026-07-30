@@ -31,18 +31,18 @@ Outputs:
     build/nn_vectors.json   the same inputs plus the int32 logits this model produces for
                             them, which is what the SoC is checked bit-for-bit against
 """
+import argparse
 import gzip
 import json
 import os
 import struct
-import sys
 import urllib.request
 
 import numpy as np
 
 SEED = 20260730
 IN_DIM = 196          # 14x14, MNIST downscaled by 2x2 average pooling
-HID_DIM = 32
+HID_DIM = 32          # overridable with --hid, for the size sweep in scripts/nn_sweep.py
 OUT_DIM = 10
 EPOCHS = 20
 BATCH = 128
@@ -125,14 +125,15 @@ def forward_float(x, p):
     return a1, h, h @ w2.T + b2
 
 
-def train(xtr, ytr, xte, yte):
+def train(xtr, ytr, xte, yte, quiet=False):
     rng = np.random.default_rng(SEED)
     p = init_params(rng)
     w1, b1, w2, b2 = p
     n = xtr.shape[0]
 
-    print(f"\ntraining float32 {IN_DIM}-{HID_DIM}-{OUT_DIM}, "
-          f"{EPOCHS} epochs, batch {BATCH}, lr {LR}")
+    if not quiet:
+        print(f"\ntraining float32 {IN_DIM}-{HID_DIM}-{OUT_DIM}, "
+              f"{EPOCHS} epochs, batch {BATCH}, lr {LR}")
     for ep in range(EPOCHS):
         order = rng.permutation(n)
         for s in range(0, n, BATCH):
@@ -162,7 +163,7 @@ def train(xtr, ytr, xte, yte):
             w1 -= LR * g_w1
             b1 -= LR * g_b1
 
-        if ep % 5 == 4 or ep == EPOCHS - 1:
+        if not quiet and (ep % 5 == 4 or ep == EPOCHS - 1):
             acc = (forward_float(xte, (w1, b1, w2, b2))[2].argmax(1) == yte).mean()
             print(f"  epoch {ep + 1:2d}  test acc {acc * 100:.2f}%")
 
@@ -294,9 +295,18 @@ def emit_vectors_h(xq, labels, path):
 
 
 def main():
-    out_h = sys.argv[1] if len(sys.argv) > 1 else "firmware/weights.h"
-    out_vec = sys.argv[2] if len(sys.argv) > 2 else "build/nn_vectors.json"
-    out_vh = sys.argv[3] if len(sys.argv) > 3 else "firmware/vectors.h"
+    global HID_DIM
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("weights_h", nargs="?", default="firmware/weights.h")
+    ap.add_argument("vectors_json", nargs="?", default="firmware/prebuilt/nn_vectors.json")
+    ap.add_argument("vectors_h", nargs="?", default="firmware/vectors.h")
+    ap.add_argument("--hid", type=int, default=HID_DIM,
+                    help="hidden layer width (default %(default)s)")
+    ap.add_argument("--quiet", action="store_true", help="suppress per-epoch output")
+    args = ap.parse_args()
+
+    HID_DIM = args.hid
+    out_h, out_vec, out_vh = args.weights_h, args.vectors_json, args.vectors_h
 
     xtr_raw, ytr, xte_raw, yte = load()
     xtr_u8 = downscale(xtr_raw)
@@ -305,7 +315,7 @@ def main():
     xtr_f = xtr_u8 / 255.0
     xte_f = xte_u8 / 255.0
 
-    p = train(xtr_f, ytr, xte_f, yte)
+    p = train(xtr_f, ytr, xte_f, yte, quiet=args.quiet)
 
     acc_f = (forward_float(xte_f, p)[2].argmax(1) == yte).mean()
 
@@ -342,16 +352,22 @@ def main():
             ],
         }, f)
 
-    print("\n=== accuracy ===")
-    print(f"  float32          {acc_f * 100:.2f}%")
-    print(f"  int8 quantised   {acc_q * 100:.2f}%")
-    print(f"  drop             {(acc_f - acc_q) * 100:+.2f} pp")
-    print(f"\n  requantise shift : >> {q['shift1']}")
-    print(f"  parameter memory : {n_bytes} bytes")
-    print(f"  MACs / inference : {IN_DIM * HID_DIM + HID_DIM * OUT_DIM}")
-    print(f"\nwrote {out_h}")
-    print(f"wrote {out_vh}")
-    print(f"wrote {out_vec}  ({N_VECTORS} vectors)")
+    macs = IN_DIM * HID_DIM + HID_DIM * OUT_DIM
+    if args.quiet:
+        # One machine-readable line for the sweep driver.
+        print(f"SUMMARY hid={HID_DIM} acc_f={acc_f * 100:.2f} acc_q={acc_q * 100:.2f} "
+              f"shift={q['shift1']} bytes={n_bytes} macs={macs}")
+    else:
+        print("\n=== accuracy ===")
+        print(f"  float32          {acc_f * 100:.2f}%")
+        print(f"  int8 quantised   {acc_q * 100:.2f}%")
+        print(f"  drop             {(acc_f - acc_q) * 100:+.2f} pp")
+        print(f"\n  requantise shift : >> {q['shift1']}")
+        print(f"  parameter memory : {n_bytes} bytes")
+        print(f"  MACs / inference : {macs}")
+        print(f"\nwrote {out_h}")
+        print(f"wrote {out_vh}")
+        print(f"wrote {out_vec}  ({N_VECTORS} vectors)")
 
 
 if __name__ == "__main__":
