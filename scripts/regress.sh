@@ -8,6 +8,19 @@ N=${1:-100}
 BODY=${2:-150}
 mkdir -p build/rand
 
+# This script used to invoke `./build/sim_run <hex> <trace>` positionally. No Makefile
+# target has ever built a binary by that name -- not in any commit -- so every seed failed
+# on a missing executable and the tally read "0 passed, N failed" regardless of whether the
+# core was correct. `make check` was unaffected, which is why it went unnoticed: the smoke
+# test passes through a different code path. The RTL simulator the Makefile does build is
+# build/sim (tb_soc), and it takes plusargs rather than positional arguments.
+VVP="$(if [ -x "$HOME/tools/oss-cad-suite/bin/vvp" ]; then echo "$HOME/tools/oss-cad-suite/bin/vvp"; else echo vvp; fi)"
+
+if [ ! -x build/sim ] || [ ! -x build/iss ]; then
+  echo "build/sim or build/iss missing -- run 'make sim iss' first" >&2
+  exit 1
+fi
+
 pass=0
 fail=0
 failed_seeds=""
@@ -18,7 +31,8 @@ for seed in $(seq 1 "$N"); do
     echo "seed $seed: ASSEMBLER ERROR"; fail=$((fail+1)); continue; }
 
   ./build/iss build/rand/r$seed.hex build/rand/r$seed.iss 500000 2> /dev/null
-  ./build/sim_run build/rand/r$seed.hex build/rand/r$seed.rtl > /dev/null 2>&1
+  "$VVP" build/sim +hex=build/rand/r$seed.hex +trace=build/rand/r$seed.rtl +max=500000 \
+    > /dev/null 2>&1
 
   if diff -q build/rand/r$seed.iss build/rand/r$seed.rtl > /dev/null 2>&1; then
     pass=$((pass+1))
