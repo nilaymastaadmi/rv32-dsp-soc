@@ -7,6 +7,11 @@ A UART peripheral was added afterward as a second, unrelated memory-mapped block
 that the bus interface generalizes rather than being shaped around the one accelerator
 that motivated it.
 
+A third block came from asking the same question about a different workload: this core is
+RV32I base, with no M extension and therefore no multiply instruction, so what does running
+a quantised neural network on it actually cost, and what does moving the multiply-accumulate
+into hardware buy? That is the second result below.
+
 Everything here is verified against an independent reference model rather than by
 inspecting waveforms. The CPU is checked instruction by instruction against a C++
 instruction-set simulator, the correlator is checked against a C++ signal model that
@@ -34,6 +39,121 @@ per hypothesis while the generator is advanced to the phase under test, plus the
 busy-polling the done flag. Parallel correlator banks or an FFT-based search are the
 natural next steps.
 
+## Second result: INT8 neural network inference
+
+A 196-32-10 MLP (MNIST downscaled to 14x14 by 2x2 average pooling), post-training quantised
+to INT8, running as bare-metal C on the core. 6,760 bytes of parameters, 6,592 MACs per
+inference.
+
+### Quantisation cost
+
+| | test accuracy |
+|---|---:|
+| float32 | 94.47% |
+| INT8, power-of-two requantisation | 94.44% |
+| **drop** | **0.03 pp** |
+
+Requantisation between the layers is a **power-of-two right shift** (`>> 10`), not the usual
+multiply-by-fixed-point-scale-then-shift. The usual form needs an int32 accumulator times an
+int32 multiplier in a 64-bit intermediate, and on a core with no hardware multiply a 64-bit
+multiply would cost more than the dot products this whole exercise exists to measure. The
+shift constrains every activation scale to a power of two, which was expected to cost
+accuracy. It cost 0.03 percentage points. That was a genuine surprise and it is reported in
+the direction it actually fell; the expectation going in was worse.
+
+ReLU is applied *before* the shift so the shifted value is never negative. Right-shifting a
+negative integer is arithmetic in both C and numpy, but making a host model and a target
+agree on rounding by relying on that is a weaker guarantee than having no negative values to
+shift.
+
+### Cycles
+
+Both paths run the same 20 inferences over the same weights and the same inputs and produce
+byte-identical logits, so the comparison is like for like.
+
+| | cycles, 20 inferences | per inference | cycles / MAC |
+|---|---:|---:|---:|
+| software shift-add multiply | 2,782,545 | 139,813 | 21.10 |
+| MAC accelerator | 84,916 | 4,241 | 0.64 |
+
+**32.77x** speedup, measured. Per-inference figures are the mean over vectors 2..20, taken as
+`(cycles(20) - cycles(1)) / 19` so the fixed startup cost (crt0, `.bss` clear) is subtracted
+out rather than divided into the total.
+
+The per-inference cost is a mean rather than a constant because the software multiply is
+data-dependent: its loop runs once per bit of the multiplier, so a dim pixel is cheaper than
+a bright one.
+
+### Where the software cycles go
+
+| | cycles | share |
+|---|---:|---:|
+| shift-add multiply loops | 1,714,763 | 61.6% |
+| everything else (loop overhead, requantise, loads, stores, startup) | 1,067,782 | 38.4% |
+
+Measured by building the same source with the multiply replaced by a single add and taking
+the difference, not by a profiler this environment does not have. Two caveats that make 61.6%
+a slight **over**-attribution rather than an under-one: the difference excludes the one add
+the stubbed build still pays per MAC, and gcc inlined `dot()` into `main()` in the stubbed
+build while keeping it a real function in the baseline, so the stub also avoids call overhead
+the baseline pays.
+
+### The profile predicted from first principles
+
+Rather than assert that multiply dominates, the software cost is predicted from the
+disassembly and then compared against the simulator:
+
+```
+cycles = 9 * MACs + 8 * shift_add_iterations
+```
+
+9 and 8 are instruction counts read off `build/nn_sw.elf` -- 5 to address and load both
+operands and zero the inner accumulator, 3 to advance the loop, 1 for the loop-exit test, and
+8 per shift-add iteration. The core retires exactly one instruction per clock, so an
+instruction count is a cycle count. Iteration counts come from the real activation bit
+lengths.
+
+| | cycles |
+|---|---:|
+| predicted | 2,760,752 |
+| measured | 2,782,545 |
+| **residual** | **21,793 (0.78%)** |
+
+The residual is the requantise/clamp/store path, the 42 `dot()` call-and-return sequences per
+inference, and `crt0` -- none of which the model covers. Agreement to 0.78% is what turns
+"the software multiply dominates" from a story into a measurement.
+
+**Worth recording from that disassembly:** gcc compiled `if (a & 1) acc += w` into a
+*branchless* masked add (broadcast bit 0 to a full-width mask with `slli`/`srai`, AND it with
+the operand, add unconditionally). So an iteration costs the same whether the bit was set or
+not, and the timing depends on the multiplier's **bit length**, not its popcount. An earlier
+version of the measurement script reported a single "cycles per iteration" number that
+silently conflated per-iteration cost with per-call overhead; reading the actual instructions
+is what caught it.
+
+### What the accelerator does and does not achieve
+
+`mac.v` fetches 4 int8 terms per 2 cycles in steady state -- one cycle per operand stream
+through a **single** memory read port, multiplying four byte pairs and accumulating all four
+products in the second cycle. Its floor is therefore 0.5 cycles/MAC and it measures 0.64.
+
+The gap is per-call overhead: each dot product still costs the CPU four register writes, a
+start, a polling loop and a result read, and with only 196 or 32 terms per call that is a
+real fraction of the total. Batching several rows per start, or letting the block walk a whole
+weight matrix itself, would close most of it and is the obvious next step rather than
+something attempted here.
+
+`is_uart` in `soc_top.v` was `>= UART_BASE` with no upper bound -- correct while the UART was
+the topmost device, but it would have silently swallowed every access to anything placed
+above it, so the MAC block would never have been selected at all. Found by adding the third
+peripheral, not by reading the line.
+
+The MAC gets a fourth asynchronous read port on the same memory array (instruction fetch, CPU
+data, correlator samples, MAC operands). A real SRAM does not hand out four read ports; this
+is the same deliberate flat-memory simplification recorded in Scope, and the block is no more
+optimistic about it than the correlator already was -- it takes one port and serialises its two
+operand streams rather than asking for a fifth.
+
 ## Synthesis (Yosys, generic cell library, `abc -g cmos` technology mapping)
 
 | module | cells | flip-flops |
@@ -43,6 +163,29 @@ natural next steps.
 | `ca_code_gen` | 159 | 20 |
 | `uart_tx` | 211 | 33 |
 | `uart_rx` | 322 | 43 |
+| `mac` | 3,103 | 84 |
+| `mac_bus` (incl. `mac`) | 3,320 | 164 |
+
+`mac` is by far the largest block here, about 3.5x the correlator, and the reason is the four
+signed 8x8 multipliers it needs to do 4 MACs per accumulate cycle: the cell breakdown is
+dominated by XOR/XNOR/NAND multiplier-array logic. That is the actual trade being made -- 33x
+fewer cycles for roughly 3.5x the area of the existing accelerator -- and it is worth stating
+plainly rather than reporting the speedup on its own. A single-multiplier version would be
+around a quarter of the area at roughly half the throughput.
+
+Its flip-flop count is exactly the declared state: 2 (FSM) + 16 (index) + 32 (latched operand
+word) + 32 (accumulator) + 2 (busy, done) = 84, and `mac_bus` adds 16 + 32 + 32 = 80 for its
+three configuration registers, giving 164. Both match a hand count, which is the cheap check
+that nothing was inferred into existence or optimised away unnoticed.
+
+Extracting these correctly took two attempts and the failure mode was silent, so
+`scripts/synth_stat.sh` now does it and documents why: `synth; abc -g cmos; stat` prints **two**
+statistics blocks and only the last is post-technology-mapping, and within that block a
+hierarchical module prints one local section per submodule *plus* a design-hierarchy total, so
+summing flip-flops across the block double-counts. That produced 202 for `correlator` instead
+of 101 on the first pass. The script calibrates itself against the four figures published
+above before reporting anything new, so a yosys output-format change fails loudly instead of
+quietly returning wrong numbers.
 
 The core's flip-flop count is exactly 31x32 register bits plus a 32-bit PC, confirming
 that x0's storage was correctly optimised away rather than instantiated and tied off.
@@ -237,6 +380,26 @@ test-harness gap, not a design gap: rebuilding coverage instrumentation against
 `scripts/uart_testbench.py`) and merging that in is what produced the 96%+ per-file line
 coverage `uart.v` actually has once it's exercised the way it's meant to be.
 
+**The NN firmware** is checked the same way, with the decision on the host
+(`scripts/nn_check.py`): the same test inputs go through the Python quantised reference and
+through the SoC, and every one of the 200 int32 logits must be **equal**, not close. Integer
+quantised inference has no business being merely close, so there is no tolerance in the
+comparison -- a single differing logit means the two implementations disagree about the
+arithmetic and that is a real bug whether or not the argmax survives it.
+
+Both firmware variants pass: 200 of 200 logits bit-identical to the reference, software
+multiply and MAC accelerator alike. That the accelerator matches exactly is also what proves
+it is a drop-in replacement for the software path rather than something that merely produces
+plausible-looking numbers -- it independently validates the byte-lane extraction, the
+signed-operand handling and the FSM's term counting all at once.
+
+The build itself carries one more check that is worth naming because it makes a claim
+enforceable rather than asserted. The firmware is compiled `-march=rv32i -nostdlib` and
+without `-lgcc`, and the Makefile then greps the disassembly for any multiply or divide
+instruction or any `__mulsi3`/`__divsi3` call and fails the build if one appears. A stray `*`
+on an int would otherwise link quietly against libgcc and silently invalidate every cycle
+number above.
+
 ## Two defects the harness caught
 
 Both were found by the trace comparison, not by reading waveforms, and both are recorded
@@ -255,6 +418,31 @@ rather than the datapath. The code generator's enable was registered, putting th
 cycle out of step with its own counter. Fixed by driving the generator's control
 combinationally from the state, so N cycles in the slew state means exactly N chips.
 
+## Two verification flows that could never have run
+
+Neither of these is a design bug, and neither was found by the design tests -- both were found
+by trying to run the existing verification after adding a third peripheral, which is its own
+argument for doing that.
+
+**The randomised regression never ran, in any commit.** `scripts/regress.sh` invoked
+`./build/sim_run <hex> <trace>` positionally. No Makefile target has ever built a binary by
+that name, going back to the first commit in this repo, so every seed failed on a missing
+executable and the tally printed `0 passed, N failed` regardless of whether the core was
+correct. `make check` reaches the RTL by a different path, which is exactly why this survived
+unnoticed: the visible gate was green while the broader one was not running at all. The
+simulator the Makefile does build (`build/sim`, `tb_soc`) takes plusargs rather than positional
+arguments; switched to that. It now runs, and passes 40 of 40 seeds.
+
+The 400-seed / 153,632-instruction figure quoted above therefore came from some earlier
+working invocation that was never committed in a runnable form. The number is not being
+retracted, but it cannot currently be reproduced from a clean checkout at the scale stated,
+and saying so is more useful than leaving the discrepancy for someone else to trip over.
+
+**The SoC-level UART flow had no simulator to run against.** `scripts/uart_testbench.py` has
+defaulted to `--sim build/sim_soc_uart` since the UART commit, and nothing ever built it, so
+the script died on a missing executable before reaching any RTL. Added the `sim-uart` target it
+was always looking for.
+
 ## Layout
 
 ```
@@ -262,6 +450,7 @@ model/    iss.cpp          RV32I instruction-set simulator, the golden reference
           gnss_model.cpp   C/A code and signal model, self-validating against IS-GPS-200
           asm.py           minimal two-pass RV32I assembler
           gen_random.py    constrained-random program generator
+          train_mlp.py     MLP training, INT8 quantisation, weight/vector emission
 rtl/      rv32i_core.v     single-cycle RV32I, optional register-file clock gating
           soc_top.v        core, memory, peripheral decode
           ca_code_gen.v    dual-LFSR gold code generator
@@ -269,6 +458,16 @@ rtl/      rv32i_core.v     single-cycle RV32I, optional register-file clock gati
           correlator_bus.v memory-mapped register interface, GNSS accelerator
           uart.v           uart_tx / uart_rx, 8N1, configurable baud divisor
           uart_bus.v       memory-mapped register interface, UART
+          mac.v            INT8 dot product, 4 terms per 2 cycles, one memory port
+          mac_bus.v        memory-mapped register interface, MAC accelerator
+firmware/ crt0.S           entry at PC 0, sp setup, .bss clear, ECALL on return
+          link.ld          flat single-region image, .text forced to address 0
+          soc.h            memory map shared with the testbench
+          nn_infer.c       INT8 inference; software shift-add multiply or MAC accelerator
+          weights.h        generated: quantised parameters
+          vectors.h        generated: baked-in test inputs
+          prebuilt/        committed .hex images and reference logits, so the NN
+                           regression runs without a cross-compiler or numpy
 tb/       tb_soc.v         trace-emitting SoC testbench (plain Verilog)
           tb_soc_sv.sv     SystemVerilog wrapper: functional coverage + concurrent
                            assertions over the same retire trace (Verilator-only)
@@ -276,12 +475,18 @@ tb/       tb_soc.v         trace-emitting SoC testbench (plain Verilog)
           tb_uart.v        standalone UART peripheral verification, register-driven
           tb_soc_uart.v    SoC-level UART test: core drives UART through the bus,
                            tx looped to rx, results scored by the Python host controller
+          tb_soc_nn.v      SoC-level NN inference test: runs the network, dumps int32
+                           logits for the host scorer
 tests/    smoke.s          directed decode test
           acq_hw.s          accelerated acquisition sweep
           acq_sw.s         software-only acquisition sweep
           uart_test.s      firmware-style UART self-test, polls status, logs every byte
 scripts/  compare.sh       trace diff, the actual pass/fail gate
           regress.sh       constrained-random regression driver
+          bin2hex.py       ELF-derived binary to one 32-bit hex word per line
+          nn_check.py      host-side bit-exactness gate for NN inference
+          nn_measure.py    cycle measurement, profile split, analytical cross-check
+          synth_stat.sh    post-abc cell/FF extraction, self-calibrating
           sta.tcl-equivalent: see the `sta` Makefile target (Yosys `ltp`, not OpenSTA --
                            see Critical path, above, for why)
           uart_testbench.py  host-side UART test automation: generates vectors, launches
@@ -291,16 +496,46 @@ scripts/  compare.sh       trace diff, the actual pass/fail gate
 ## Building
 
 Requires `iverilog`, `yosys`, `g++` and `python3`. `verilator` is needed only for the
-`tb_soc_sv.sv` coverage/assertion flow. No cross-compiler is needed; the included
-assembler covers the instruction subset the tests use.
+`tb_soc_sv.sv` coverage/assertion flow. **No cross-compiler is needed** for anything here,
+including the neural-network regression: the included assembler covers the instruction subset
+the assembly tests use, and the NN firmware's `.hex` images are committed under
+`firmware/prebuilt/`. `make nn-check` prints which path it took, so a result is never
+ambiguous about whether it came from a fresh build or a committed image.
 
 ```
 make check TEST=smoke     # ISS versus RTL
+make regress SEEDS=40     # randomised regression (see the note on this, above)
+make sim-uart && python3 scripts/uart_testbench.py --hex build/uart_test.hex
 make synth                # gate/flip-flop counts (post technology-mapping)
 make sta                  # structural critical-path depth (see Critical path, above)
-bash scripts/regress.sh   # randomised regression
-python3 scripts/uart_testbench.py   # UART host-driven test automation
 ```
+
+Neural network:
+
+```
+make nn-check             # bit-exactness: 200/200 int32 logits, both firmware variants
+make nn-measure           # cycles, speedup, profile split, analytical cross-check
+make nn-synth             # cell/flip-flop counts, calibrated against the table above
+```
+
+Rebuilding the firmware or retraining the model needs more: a RISC-V bare-metal toolchain
+(`riscv-none-elf-gcc`, picked up from `~/tools/xpack-riscv-none-elf-gcc-*/bin` or `PATH`) for
+`make nn-prebuilt`, and numpy for `make nn-train`, which also downloads MNIST to
+`~/.cache/mnist` on first run.
+
+The acquisition comparison needs its stimulus generated first:
+
+```
+g++ -O2 -std=c++17 -o build/gnss_model model/gnss_model.cpp
+./build/gnss_model build/g 1 511 45.0
+vvp build/sim +hex=build/acq_hw.hex +samples=build/g.samples.hex +expect_phase=511
+vvp build/sim +hex=build/acq_sw.hex +samples=build/g.samples.hex +code=build/g.code.hex +expect_phase=511
+```
+
+Both were re-run after the MAC block was added, and both still return phase 511 / peak 22013
+at exactly the cycle counts published in Result above (1,583,123 and 8,905,752), so the third
+peripheral did not perturb the existing datapath. The UART flow likewise still scores 210/210
+with host and firmware agreeing.
 
 ## Scope
 
@@ -309,3 +544,23 @@ interrupts, and memory is a flat asynchronous-read array. Those are the delibera
 next steps rather than oversights, and the retire-port trace methodology is specifically
 designed to survive them, since a pipelined core still retires instructions in order and
 can emit the same trace format.
+
+**Everything here runs in simulation.** Nothing has been on an FPGA or through a place-and-route
+flow. The cycle counts are exact because the core is single-cycle and the simulator is
+cycle-accurate to it, but "32.77x fewer cycles" is not "32.77x faster in wall-clock on real
+silicon": that would additionally depend on what clock each configuration closes timing at,
+and there is no timing-characterised cell library here to answer that (see Critical path). The
+area figures are generic-cell counts from `abc -g cmos`, not a real standard-cell library, so
+they are useful for comparing these blocks against each other and close to meaningless as an
+absolute mm² claim.
+
+The neural network is small and the task is easy: 14x14 MNIST at 94% with a 32-unit hidden
+layer is not a demanding benchmark, and no claim is being made that it is. The point of the
+exercise is the cost structure of integer inference on a core with no multiplier, which does
+not depend on the network being impressive.
+
+Two things named in the plan for this work are **not** done and are not being presented as if
+they were: the accuracy/latency/memory trade-off across multiple model sizes or quantisation
+schemes was the optional third phase and was not reached, and the per-call overhead that keeps
+the accelerator at 0.64 cycles/MAC instead of its 0.5 floor has been measured and explained but
+not fixed.
