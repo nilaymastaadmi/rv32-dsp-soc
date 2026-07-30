@@ -1,6 +1,7 @@
-// Top level: RV32I core, unified memory, the GNSS correlator accelerator, and a UART.
+// Top level: RV32I core, unified memory, the GNSS correlator accelerator, a UART, and an
+// INT8 dot-product accelerator for the neural-network firmware.
 //
-// Two peripherals now share the bus at distinct sub-regions, which is the standard shape
+// Three peripherals now share the bus at distinct sub-regions, which is the standard shape
 // of a real SoC address map: one region per device, decoded off the high address bits.
 // Instruction fetch and CPU data access still share one memory array with asynchronous
 // read, mirroring the C++ ISS's flat address space exactly, so the two models can only
@@ -10,6 +11,7 @@ module soc_top #(
     parameter MEM_WORDS   = 65536,
     parameter PERIPH_BASE = 32'h1000_0000,
     parameter UART_BASE   = 32'h1000_1000,
+    parameter MAC_BASE    = 32'h1000_2000,
     parameter ACC_W       = 32
 ) (
     input  wire        clk,
@@ -58,14 +60,31 @@ module soc_top #(
     // Sub-decode within the peripheral region: UART_BASE sits above the correlator's
     // register file (which occupies 0x00-0x17 off PERIPH_BASE), so the two ranges cannot
     // overlap even as either grows.
-    wire is_periph      = (dmem_addr >= PERIPH_BASE) && (dmem_addr < UART_BASE);
-    wire is_uart         = (dmem_addr >= UART_BASE);
-    wire is_any_periph   = is_periph || is_uart;
+    //
+    // The UART's range is now bounded above as well. It used to be an open-ended
+    // `>= UART_BASE`, which was correct while it was the topmost device but would have
+    // silently swallowed every access to anything placed above it -- adding the MAC block
+    // at MAC_BASE would have decoded as UART and the accelerator would simply never have
+    // been selected. Worth naming as a real latent bug that adding a third peripheral
+    // exposed, rather than a line that was always right.
+    wire is_periph     = (dmem_addr >= PERIPH_BASE) && (dmem_addr < UART_BASE);
+    wire is_uart       = (dmem_addr >= UART_BASE)   && (dmem_addr < MAC_BASE);
+    wire is_mac        = (dmem_addr >= MAC_BASE);
+    wire is_any_periph = is_periph || is_uart || is_mac;
 
     wire [31:0] sample_addr;
     wire signed [31:0] sample_data = mem[sample_addr[31:2]];
 
-    wire [31:0] corr_rdata, uart_rdata;
+    // Operand fetch port for the MAC block. This is a fourth asynchronous read port on the
+    // same array (instruction fetch, CPU data, correlator samples, and now MAC operands).
+    // A real SRAM would not hand out four read ports for free; the flat async-read memory
+    // is the same deliberate simplification documented in Scope, and the MAC is no more
+    // optimistic about it than the correlator already was -- it uses a single port and
+    // fetches its two operand streams on alternate cycles rather than asking for a fifth.
+    wire [31:0] mac_addr;
+    wire [31:0] mac_data = mem[mac_addr[31:2]];
+
+    wire [31:0] corr_rdata, uart_rdata, mac_rdata;
 
     correlator_bus #(.ACC_W(ACC_W)) u_corr_bus (
         .clk         (clk),
@@ -91,10 +110,23 @@ module soc_top #(
         .rx_pin (uart_rx_pin)
     );
 
+    mac_bus #(.ACC_W(ACC_W)) u_mac_bus (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .sel      (is_mac),
+        .we       (dmem_we),
+        .addr     (dmem_addr),
+        .wdata    (dmem_wdata),
+        .rdata    (mac_rdata),
+        .mem_addr (mac_addr),
+        .mem_data (mac_data)
+    );
+
     assign imem_data = mem[imem_addr[31:2]];
 
     always @(*) begin
-        if (is_uart)         dmem_rdata = uart_rdata;
+        if (is_mac)          dmem_rdata = mac_rdata;
+        else if (is_uart)    dmem_rdata = uart_rdata;
         else if (is_periph)  dmem_rdata = corr_rdata;
         else                 dmem_rdata = mem[dmem_addr[31:2]];
     end
